@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HELIARK Adaptive Wind Strategy</title>
+<style>
+:root{--bg:#e9eef3;--panel:#fbfcfd;--ink:#14202b;--mute:#5a6b7a;--line:#ccd6df;--accent:#0b6e8a;--good:#1b7f4b;--warn:#b4570b;--bad:#b3261e;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0d1520;--panel:#152131;--ink:#e6edf4;--mute:#93a4b5;--line:#27384c;--accent:#4cc3e0;--good:#58d68d;--warn:#f0a35a;--bad:#ff8a80}}
+:root[data-theme="dark"]{--bg:#0d1520;--panel:#152131;--ink:#e6edf4;--mute:#93a4b5;--line:#27384c;--accent:#4cc3e0;--good:#58d68d;--warn:#f0a35a;--bad:#ff8a80}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:"Trebuchet MS","Segoe UI",system-ui,sans-serif;overflow:hidden}
+canvas#c{display:block;width:100%;height:100%;touch-action:none;cursor:grab}
+#ui{position:fixed;left:12px;top:calc(12px + env(safe-area-inset-top,0px));width:min(350px,calc(100% - 24px));max-height:calc(100% - 90px);overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;font-size:13px;line-height:1.4;box-sizing:border-box}
+h1{font-size:17px;margin:0}.sub{color:var(--mute);margin:2px 0 6px}
+details{border-top:1px solid var(--line);padding:6px 0}summary{cursor:pointer;font-weight:700;padding:3px 0}
+label{display:flex;justify-content:space-between;margin-top:7px;color:var(--mute)}label b{color:var(--ink);font-weight:600}
+input[type=range]{width:100%;accent-color:var(--accent);margin:2px 0 0}
+select,button{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:5px 8px;cursor:pointer}
+select{width:100%;margin-top:4px}button:hover{border-color:var(--accent)}button:focus-visible,select:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.row{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}.chk{display:flex;gap:6px;align-items:center;margin-top:7px;color:var(--ink)}
+#state{padding:7px 10px;border-left:4px solid var(--accent);background:var(--bg);border-radius:4px}#state strong{display:block;font-size:15px}
+.cv{display:flex;gap:8px;margin-top:8px}canvas.m{background:var(--bg);border:1px solid var(--line);border-radius:6px}
+table{width:100%;margin-top:6px;border-collapse:collapse}td{padding:2px 0;border-bottom:1px solid var(--line)}td+td{text-align:right;font-variant-numeric:tabular-nums}
+.note{margin-top:8px;color:var(--mute);font-size:11.5px}
+#pill{position:fixed;left:50%;transform:translateX(-50%);top:calc(10px + env(safe-area-inset-top,0px));background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:6px 14px;font-weight:700;font-size:13px;white-space:nowrap}
+#tools{position:fixed;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));display:flex;flex-wrap:wrap;gap:5px;justify-content:flex-end;max-width:60%}
+#tools button{background:var(--panel)}
+@media(max-width:700px){#ui{top:auto;bottom:calc(60px + env(safe-area-inset-bottom,0px));max-height:46%}#tools{max-width:100%;bottom:calc(8px + env(safe-area-inset-bottom,0px))}}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="pill">…</div>
+<div id="ui">
+<h1>HELIARK Adaptive Wind Strategy</h1>
+<p class="sub">Three.js frontend + Python simulation backend. Drag to orbit, scroll to zoom. Dimensions come from the SEVC 2026 design report.</p>
+<details open><summary>Conditions</summary>
+<div class="row"><button data-p="0,0">Calm</button><button data-p="8,0">Headwind</button><button data-p="9,55">Quartering</button><button data-p="12,90">Broadside</button><button data-p="10,140">Rear quarter</button></div>
+<div data-sl="v"></div><div data-sl="w"></div><div data-sl="b"></div>
+<div class="note" style="margin-top:2px">0° headwind · 90° from the right · 180° tailwind · 270° from the left</div>
+<label class="chk"><input type="checkbox" id="gust"> Gusty wind (tests hysteresis)</label></details>
+<details open><summary>Fin and controller</summary>
+<label>Fin candidate</label><select id="geo"><option value="A">A – Flat plate</option><option value="B" selected>B – Symmetric airfoil</option><option value="C">C – Cambered airfoil</option><option value="D">D – High-aspect-ratio fin</option></select>
+<div data-sl="span"></div><div data-sl="ch"></div>
+<label>Aerodynamic model</label><select id="model"><option value="toy_v2">Toy approximation (unvalidated)</option><option value="cfd_table" disabled>CFD lookup (load dataset first)</option><option value="ml_surrogate" disabled>ML surrogate (train dataset first)</option></select>
+<label>Control mode</label><select id="mode"><option value="auto">Auto (software decides)</option><option value="ret">Force retract</option><option value="man">Manual angle (no safety checks)</option></select>
+<div data-sl="m"></div><div data-sl="lim"></div>
+<label class="chk"><input type="checkbox" id="fault"> Simulate sensor or actuator fault</label></details>
+<details open><summary>Decision</summary>
+<div id="state"><strong id="sName">—</strong><span id="sWhy" style="color:var(--mute)"></span></div>
+<div class="cv"><canvas id="cmp" class="m" width="120" height="120"></canvas><canvas id="crv" class="m" width="190" height="120"></canvas></div><canvas id="hst" class="m" width="310" height="64" style="margin-top:8px;width:100%"></canvas>
+<div class="note" style="margin-top:3px">Left: wind (blue), apparent wind (teal), fin. Right: Fx (green) and Fy (orange) for each fin angle; red zones break the side-force limit. Bottom: fin Fx over the last ~15 s, adaptive in green and a fixed fin at the manual angle in grey.</div>
+<table>
+<tr><td>Apparent wind</td><td id="rA"></td></tr>
+<tr><td>Fin angle / angle of attack</td><td id="rF"></td></tr>
+<tr><td>Fin forward force Fx</td><td id="rX"></td></tr>
+<tr><td>Fin side force Fy</td><td id="rY"></td></tr>
+<tr><td>Tractive power, no fin</td><td id="rP0"></td></tr>
+<tr><td>Tractive power, with fin</td><td id="rP1"></td></tr>
+<tr><td>Energy gained, adaptive fin</td><td id="rE"></td></tr><tr><td>Energy gained, fixed fin at manual angle</td><td id="rE2"></td></tr>
+</table><div class="row"><button id="rst">Reset energy</button></div></details>
+<div class="note">The toy aerodynamic model is an unvalidated isolated-fin approximation, not CFD or HELIARK performance data. Backend energy can include configured actuator power and fin mass; default values are zero until measured.</div>
+</div>
+<div id="tools"><button data-c="iso">Iso</button><button data-c="top">Top</button><button data-c="side">Side</button><button data-c="rear">Rear</button><button data-c="front">Front</button><button id="orb">Auto-orbit</button><button id="air">Airflow: on</button><button id="pz">Pause</button></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const $=id=>document.getElementById(id),D2R=Math.PI/180;
+const dark=matchMedia('(prefers-color-scheme: dark)').matches;
+const SL=[['v','Vehicle speed',40,85,1,60,' km/h'],['w','Wind speed',0,15,.5,8,' m/s'],['b','Wind from',0,359,1,70,'°'],['span','Fin height',.5,1,.05,.8,' m'],['ch','Fin chord',.3,.7,.05,.5,' m'],['m','Manual fin angle',-30,30,1,15,'°'],['lim','Side-force limit',20,400,10,200,' N']];
+document.querySelectorAll('[data-sl]').forEach(e=>{const s=SL.find(x=>x[0]===e.dataset.sl);
+ e.outerHTML=`<label>${s[1]} <b id="o_${s[0]}"></b></label><input id="${s[0]}" type="range" min="${s[2]}" max="${s[3]}" step="${s[4]}" value="${s[5]}">`});
+
+// ---------- scene ----------
+const R=new THREE.WebGLRenderer({canvas:$('c'),antialias:true});R.setPixelRatio(Math.min(devicePixelRatio,2));R.shadowMap.enabled=true;R.shadowMap.type=THREE.PCFSoftShadowMap;
+const sc=new THREE.Scene();sc.background=new THREE.Color(dark?0x0d1520:0xe9eef3);sc.fog=new THREE.Fog(sc.background,28,75);
+const cam=new THREE.PerspectiveCamera(45,1,0.1,200);
+sc.add(new THREE.HemisphereLight(0xffffff,dark?0x1a2a3a:0x9aa8b5,0.95));
+const sun=new THREE.DirectionalLight(0xffffff,0.9);sun.position.set(-4,8,5);sun.castShadow=true;sun.shadow.mapSize.set(2048,2048);sun.shadow.bias=-0.0006;Object.assign(sun.shadow.camera,{left:-6,right:6,top:6,bottom:-6,near:1,far:25});sc.add(sun);
+const gnd=new THREE.Mesh(new THREE.PlaneGeometry(300,300),new THREE.MeshStandardMaterial({color:dark?0x172434:0xd5dde4}));gnd.rotation.x=-Math.PI/2;sc.add(gnd);
+const road=new THREE.Mesh(new THREE.PlaneGeometry(300,7),new THREE.MeshStandardMaterial({color:dark?0x2a3441:0x8b97a3}));road.rotation.x=-Math.PI/2;road.position.y=0.005;sc.add(road);
+const dashes=[];for(let i=0;i<40;i++){const d=new THREE.Mesh(new THREE.PlaneGeometry(1.6,0.12),new THREE.MeshBasicMaterial({color:0xf2f2f2}));d.rotation.x=-Math.PI/2;d.position.set(-80+i*4,0.012,0);sc.add(d);dashes.push(d)}
+
+// ---------- HELIARK (x forward, z right, 1 unit = 1 m) ----------
+const car=new THREE.Group();sc.add(car);
+const CX=-0.05,A=1.85,B=0.8,FW=[[0.85,0.49],[0.85,-0.49]],RW=[-0.9,0];
+function rr(p,cx,cy,w,h,r){p.moveTo(cx-w/2+r,cy-h/2);p.lineTo(cx+w/2-r,cy-h/2);p.quadraticCurveTo(cx+w/2,cy-h/2,cx+w/2,cy-h/2+r);p.lineTo(cx+w/2,cy+h/2-r);p.quadraticCurveTo(cx+w/2,cy+h/2,cx+w/2-r,cy+h/2);p.lineTo(cx-w/2+r,cy+h/2);p.quadraticCurveTo(cx-w/2,cy+h/2,cx-w/2,cy+h/2-r);p.lineTo(cx-w/2,cy-h/2+r);p.quadraticCurveTo(cx-w/2,cy-h/2,cx-w/2+r,cy-h/2)}
+const shp=new THREE.Shape();
+for(let i=0;i<=96;i++){const t=i/96*2*Math.PI,c=Math.cos(t),s=Math.sin(t);const x=CX+A*Math.sign(c)*Math.abs(c)**(2/3),y=B*Math.sign(s)*Math.abs(s)**(2/3);i?shp.lineTo(x,y):shp.moveTo(x,y)}
+[[...FW[0]],[...FW[1]],[...RW]].forEach(([x,z])=>{const h=new THREE.Path();rr(h,x,z,0.62,0.2,0.06);shp.holes.push(h)});
+const ck=new THREE.Path();ck.absellipse(-0.4,0,0.55,0.21,0,Math.PI*2,false);shp.holes.push(ck);
+const bg=new THREE.ExtrudeGeometry(shp,{depth:0.33,bevelEnabled:true,bevelThickness:0.02,bevelSize:0.02,bevelSegments:2,curveSegments:24});bg.rotateX(-Math.PI/2);
+const body=new THREE.Mesh(bg,new THREE.MeshStandardMaterial({color:0x15181c,roughness:0.35,metalness:0.3}));body.position.y=0.15;car.add(body);
+// solar panels
+const pc=document.createElement('canvas');pc.width=225;pc.height=98;const g=pc.getContext('2d');g.fillStyle='#13306b';g.fillRect(0,0,225,98);g.strokeStyle='#3d63ad';g.lineWidth=1;
+for(let i=0;i<=5;i++){g.beginPath();g.moveTo(i*45,0);g.lineTo(i*45,98);g.stroke()}for(let j=0;j<=4;j++){g.beginPath();g.moveTo(0,j*24.5);g.lineTo(225,j*24.5);g.stroke()}
+const ptex=new THREE.CanvasTexture(pc),pmat=new THREE.MeshStandardMaterial({map:ptex,roughness:0.25,metalness:0.5});
+const MX=-1.45,rects=[[0.85,0.49,.34,.12],[0.85,-0.49,.34,.12],[-0.9,0,.34,.12],[-0.4,0,.57,.23],[MX,0,.55,.3]];
+const ov=(a,b,c,d,e,f,h,k)=>Math.abs(a-e)<c+h&&Math.abs(b-f)<d+k;let np=0;
+for(const x of [-1.38,-0.46,0.46,1.38])for(const z of [-0.6,-0.2,0.2,0.6]){
+ let ok=true;for(const [dx,dz] of [[.45,.195],[.45,-.195],[-.45,.195],[-.45,-.195]])if(Math.abs((x+dx-CX)/(A-.06))**3+Math.abs((z+dz)/(B-.06))**3>1)ok=false;
+ if(ok&&rects.every(r=>!ov(x,z,.45,.195,r[0],r[1],r[2],r[3]))){const p=new THREE.Mesh(new THREE.BoxGeometry(0.9,0.006,0.39),pmat);p.position.set(x,0.503,z);car.add(p);np++}}
+// decals, driver, fin slot
+const dc=document.createElement('canvas');dc.width=512;dc.height=128;const dg=dc.getContext('2d');dg.fillStyle='#f4f6f8';dg.fillRect(0,0,512,128);dg.fillStyle='#14202b';dg.font='bold 54px Trebuchet MS,sans-serif';dg.fillText('SolarMobil',16,60);dg.fillStyle='#c4301f';dg.font='bold 44px Trebuchet MS,sans-serif';dg.fillText('HELIARK',16,110);
+const dtex=new THREE.CanvasTexture(dc);[1,-1].forEach(s=>{const d=new THREE.Mesh(new THREE.PlaneGeometry(0.8,0.2),new THREE.MeshBasicMaterial({map:dtex}));d.position.set(-0.05,0.32,s*0.826);if(s<0)d.rotation.y=Math.PI;car.add(d)});
+const helm=new THREE.Mesh(new THREE.SphereGeometry(0.11,20,14),new THREE.MeshStandardMaterial({color:0xc4301f}));helm.position.set(-0.7,0.45,0);car.add(helm);
+const slot=new THREE.Mesh(new THREE.BoxGeometry(0.5,0.008,0.18),new THREE.MeshStandardMaterial({color:0x555d66}));slot.position.set(MX,0.505,0);car.add(slot);
+// wheels (tyre 120/70-12: radius 0.2334 m, width 0.12 m)
+const WR=0.2334,wheels=[],tm=new THREE.MeshStandardMaterial({color:0x1b1b1b,roughness:0.9}),hm=new THREE.MeshStandardMaterial({color:0xc9ced4,metalness:0.6,roughness:0.4});
+[...FW,RW].forEach(([x,z])=>{const gr=new THREE.Group(),sp=new THREE.Group();
+ const t=new THREE.Mesh(new THREE.CylinderGeometry(WR,WR,0.12,36),tm);t.rotation.x=Math.PI/2;sp.add(t);
+ for(let i=0;i<5;i++){const b=new THREE.Mesh(new THREE.BoxGeometry(0.03,0.15,0.125),hm);b.position.y=0.07;const h=new THREE.Group();h.rotation.z=i*Math.PI*2/5;h.add(b);sp.add(h)}
+ const hub=new THREE.Mesh(new THREE.CylinderGeometry(0.06,0.06,0.13,16),hm);hub.rotation.x=Math.PI/2;sp.add(hub);
+ gr.add(sp);gr.position.set(x,WR,z);car.add(gr);wheels.push(sp)});
+const arm=new THREE.Mesh(new THREE.BoxGeometry(0.5,0.05,0.04),hm);arm.position.set(RW[0]+0.3,0.26,0.1);car.add(arm);
+
+// ---------- fin ----------
+const GEO={A:{t:.03,m:0,a0:0,k:.85,cd0:.035,st:.15,span:.8,ch:.5},B:{t:.12,m:0,a0:0,k:1,cd0:.014,st:.21,span:.8,ch:.5},C:{t:.12,m:.04,a0:-4,k:1,cd0:.018,st:.2,span:.8,ch:.5},D:{t:.12,m:0,a0:0,k:1,cd0:.014,st:.21,span:1,ch:.35}};
+function foil(t,m){const n=28,P=.4,pts=[];const yc=x=>m?(x<P?m/P/P*(2*P*x-x*x):m/(1-P)**2*((1-2*P)+2*P*x-x*x)):0;
+ const yt=x=>5*t*(0.2969*Math.sqrt(x)-0.126*x-0.3516*x*x+0.2843*x**3-0.1036*x**4);
+ const X=i=>.25-(1-Math.cos(Math.PI*i/n))/2,xn=i=>(1-Math.cos(Math.PI*i/n))/2;
+ const s=new THREE.Shape();s.moveTo(X(0),0);for(let i=1;i<=n;i++)s.lineTo(X(i),yc(xn(i))+yt(xn(i)));for(let i=n-1;i>=0;i--)s.lineTo(X(i),yc(xn(i))-yt(xn(i)));
+ const e=new THREE.ExtrudeGeometry(s,{depth:1,bevelEnabled:false});e.rotateX(-Math.PI/2);return e}
+const finPivot=new THREE.Group();finPivot.position.set(MX,0.508,0);car.add(finPivot);
+const fin=new THREE.Mesh(foil(.12,0),new THREE.MeshStandardMaterial({color:0xff7a2f,roughness:0.4}));finPivot.add(fin);
+function setGeo(){const g=GEO[$('geo').value];fin.geometry.dispose();fin.geometry=foil(g.t,g.m);$('span').value=g.span;$('ch').value=g.ch}
+$('geo').onchange=setGeo;
+const arrX=new THREE.ArrowHelper(new THREE.Vector3(1,0,0),new THREE.Vector3(),1,0x3ddc84,0.15,0.1),arrZ=new THREE.ArrowHelper(new THREE.Vector3(0,0,1),new THREE.Vector3(),1,0xffb347,0.15,0.1);car.add(arrX,arrZ);
+
+// ---------- airflow ----------
+const N=700,P=new Float32Array(N*3),L=new Float32Array(N*6);
+function spawn(i){P[i*3]=(Math.random()-.5)*26;P[i*3+1]=0.08+Math.random()*2.4;P[i*3+2]=(Math.random()-.5)*14}for(let i=0;i<N;i++)spawn(i);
+const lg=new THREE.BufferGeometry();lg.setAttribute('position',new THREE.BufferAttribute(L,3));
+const lines=new THREE.LineSegments(lg,new THREE.LineBasicMaterial({color:0x6cc4ee,transparent:true,opacity:0.55}));lines.frustumCulled=false;sc.add(lines);
+$('air').onclick=()=>{lines.visible=!lines.visible;$('air').textContent='Airflow: '+(lines.visible?'on':'off')};
+
+// ---------- camera ----------
+let th=2.3,ph=1.15,rad=8,tth=th,tph=ph,trad=rad,orbit=false;const T=new THREE.Vector3(-0.1,0.35,0);
+const CP={iso:[2.3,1.1,8],top:[Math.PI,0.06,7],side:[Math.PI/2,1.45,6.5],rear:[Math.PI,1.3,6.5],front:[0,1.3,6.5]};
+document.querySelectorAll('[data-c]').forEach(b=>b.onclick=()=>{[tth,tph,trad]=CP[b.dataset.c];th=((th%(2*Math.PI))+2*Math.PI)%(2*Math.PI);orbit=false;$('orb').style.borderColor=''});
+$('orb').onclick=()=>{orbit=!orbit;$('orb').style.borderColor=orbit?'var(--accent)':''};
+let drag=false,lx=0,ly=0;const cv=$('c');
+cv.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;cv.setPointerCapture(e.pointerId)});cv.addEventListener('pointerup',()=>drag=false);
+cv.addEventListener('pointermove',e=>{if(!drag)return;th-=(e.clientX-lx)*.006;ph=Math.min(1.5,Math.max(.05,ph-(e.clientY-ly)*.006));tth=th;tph=ph;lx=e.clientX;ly=e.clientY});
+cv.addEventListener('wheel',e=>{e.preventDefault();rad=trad=Math.min(16,Math.max(3,rad+e.deltaY*.005))},{passive:false});
+function size(){R.setSize(innerWidth,innerHeight,false);cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix()}addEventListener('resize',size);size();
+document.querySelectorAll('[data-p]').forEach(b=>b.onclick=()=>{const [w,bb]=b.dataset.p.split(',');$('w').value=w;$('b').value=bb});
+
+// ---------- Python backend integration ----------
+const RHO=1.225;
+let apiSessionId=null, apiResult=null, apiBusy=false, apiAccumulator=0, apiError='';
+async function initBackend(){
+ try{const r=await fetch('/api/v1/sessions',{method:'POST'});if(!r.ok)throw new Error('HTTP '+r.status);apiSessionId=(await r.json()).session_id;}
+ catch(e){apiError='Backend unavailable: '+e.message;}
+}
+initBackend();
+async function refreshModels(){try{const r=await fetch('/api/v1/models');if(!r.ok)return;const data=await r.json();const sel=$('model');for(const m of data.models){let op=sel.querySelector(`option[value="${m.name}"]`);if(!op){op=document.createElement('option');op.value=m.name;op.textContent=m.name;sel.appendChild(op)}op.disabled=false;op.textContent=m.name+(m.validated?' (validated)':' (unvalidated)')}}catch(e){}}
+setInterval(refreshModels,3000);refreshModels();
+async function backendStep(payload){
+ if(!apiSessionId||apiBusy)return;apiBusy=true;
+ try{const r=await fetch(`/api/v1/sessions/${apiSessionId}/step`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  if(!r.ok)throw new Error('HTTP '+r.status+' '+await r.text());apiResult=await r.json();apiError='';
+ }catch(e){apiError='Backend error: '+e.message;}finally{apiBusy=false;}
+}
+const cmd={state:'RETRACT',delta:0,t:-9};let dep=.02,ang=0,sdH=1,tt=0,held=false,paused=false;const hist=[];
+$('rst').onclick=async()=>{hist.length=0;if(apiSessionId)await fetch(`/api/v1/sessions/${apiSessionId}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({energy_only:true})})};
+$('pz').onclick=()=>{paused=!paused;$('pz').textContent=paused?'Resume':'Pause'};
+const cc=$('cmp').getContext('2d'),cr=$('crv').getContext('2d');
+function arrow(c,x0,y0,x1,y1,col){c.strokeStyle=col;c.fillStyle=col;c.lineWidth=2;c.beginPath();c.moveTo(x0,y0);c.lineTo(x1,y1);c.stroke();const a=Math.atan2(y1-y0,x1-x0);c.beginPath();c.moveTo(x1,y1);c.lineTo(x1-7*Math.cos(a-.4),y1-7*Math.sin(a-.4));c.lineTo(x1-7*Math.cos(a+.4),y1-7*Math.sin(a+.4));c.fill()}
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const clock=new THREE.Clock();
+function tick(){
+ const dt0=Math.min(clock.getDelta(),.05),dt=paused?0:dt0;tt+=dt;
+ SL.forEach(s=>$('o_'+s[0]).textContent=$(s[0]).value+s[6]);
+ const v=+$('v').value/3.6,mode=$('mode').value,gk=GEO[$('geo').value],span=+$('span').value,ch=+$('ch').value,AR=span/ch,S=span*ch,lim=+$('lim').value;
+ let W=+$('w').value,Bd=+$('b').value;
+ if($('gust').checked&&W>0){W=Math.max(0,W*(1+.35*(Math.sin(tt*1.3)+.6*Math.sin(tt*3.1+1))/1.6));Bd+=14*Math.sin(tt*.9+2)}
+ const B_=Bd*D2R,sx=W*Math.cos(B_)+v,sz=W*Math.sin(B_),VaLocal=Math.hypot(sx,sz),gamLocal=Math.atan2(Math.abs(sz),sx)/D2R;
+ if(Math.abs(sz)>.05)sdH=Math.sign(sz);const sdLocal=sdH;
+ // Send simulation inputs to the Python controller at 10 Hz; rendering remains local at display refresh rate.
+ apiAccumulator+=dt;
+ if(apiAccumulator>=.1&&!apiBusy&&apiSessionId){const stepDt=Math.min(apiAccumulator,.5);apiAccumulator=0;
+  backendStep({v_kmh:+$('v').value,wind_ms:+$('w').value,wind_from_deg:+$('b').value,gust:$('gust').checked,
+   geometry:$('geo').value,span_m:span,chord_m:ch,mode,manual_deg:+$('m').value,side_force_limit_n:lim,
+   fault:$('fault').checked,model:$('model').value,dt:stepDt});}
+ const result=apiResult;
+ let name=result?.state||'CONNECTING TO BACKEND',why=result?(result.reason+' · '+result.model.provenance+(result.model.validated?' · validated':' · UNVALIDATED')):(apiError||'Waiting for Python simulation response.');
+ let on=!!result?.fin?.deployed,delta=result?.fin?.angle_deg||0;
+ const f=result?{fx:result.forces.fx_n,fy:result.forces.fy_n,aoa:result.fin.aoa_deg}:{fx:0,fy:0,aoa:0};
+ const Va=result?.flow?.va_ms??Math.hypot(W*Math.cos(Bd*D2R)+v,W*Math.sin(Bd*D2R));
+ const gam=result?.flow?.apparent_angle_deg??Math.atan2(Math.abs(W*Math.sin(Bd*D2R)),W*Math.cos(Bd*D2R)+v)/D2R;
+ const sd=result?.flow?.side??sdH;
+ const P0=result?.power?.no_fin_w??0,P1=result?.power?.with_fin_w??0;
+ const Eacc=result?.energy?.adaptive_wh??0,Efix=result?.energy?.fixed_wh??0;
+ const fixfx=result?.fixed_fin?.fx_n??0;
+ // UI text
+ const col=name==='PROPULSION'?'var(--good)':name==='MANUAL'?'var(--warn)':name.startsWith('SAFE')?'var(--bad)':'var(--accent)';
+ $('sName').textContent=name;$('sName').style.color=col;$('state').style.borderLeftColor=col;$('sWhy').textContent=why;
+ $('pill').textContent=on?`${name} · fin ${delta.toFixed(0)}° · ${f.fx>=0?'+':''}${f.fx.toFixed(0)} N`:`${name} · fin stowed`;$('pill').style.color=col;
+ $('rA').textContent=`${Va.toFixed(1)} m/s at ${gam.toFixed(0)}°`;$('rF').textContent=on?`${delta.toFixed(0)}° / ${f.aoa.toFixed(0)}°`:'stowed';
+ $('rX').textContent=on?`${f.fx.toFixed(0)} N`:'0 N';$('rY').textContent=on?`${Math.abs(f.fy).toFixed(0)} N to the ${sd*f.fy<0?'left':'right'}`:'0 N';
+ $('rP0').textContent=(P0/1000).toFixed(2)+' kW';$('rP1').textContent=`${(P1/1000).toFixed(2)} kW${P0>50?` (${((P1-P0)/P0*100).toFixed(1)}%)`:''}`;
+ $('rE').textContent=(Eacc>=0?'+':'')+Eacc.toFixed(2)+' Wh';$('rE2').textContent=(Efix>=0?'+':'')+Efix.toFixed(2)+' Wh';
+ // fin animation
+ dep+=((on?1:.02)-dep)*Math.min(1,dt*4);fin.scale.set(ch,Math.max(.01,span*dep),sd*ch);
+ ang+=(-sd*delta*D2R*(on?1:0)-ang)*Math.min(1,dt*5);finPivot.rotation.y=ang;
+ const o=new THREE.Vector3(MX,.508+span*dep*.5,0);
+ [[arrX,f.fx,0],[arrZ,sd*f.fy,1]].forEach(([a,val,z])=>{const len=Math.abs(val)/50;a.visible=on&&len>.08;if(!a.visible)return;a.position.copy(o);a.setDirection(z?new THREE.Vector3(0,0,Math.sign(val)):new THREE.Vector3(Math.sign(val),0,0));a.setLength(Math.min(len,3),.18,.1)});
+ // compass
+ const c=cc,cw=120;c.clearRect(0,0,cw,cw);c.strokeStyle=css('--line');c.beginPath();c.arc(60,60,50,0,7);c.stroke();
+ c.fillStyle=css('--mute');c.fillRect(54,42,12,36);c.fillStyle=css('--ink');c.beginPath();c.moveTo(60,36);c.lineTo(66,44);c.lineTo(54,44);c.fill();
+ arrow(c,60+50*Math.sin(B_),60-50*Math.cos(B_),60+16*Math.sin(B_),60-16*Math.cos(B_),'#4a90d9');
+ const gs=gam*D2R*sd;arrow(c,60+50*Math.sin(gs),60-50*Math.cos(gs),60+16*Math.sin(gs),60-16*Math.cos(gs),css('--accent'));
+ if(on){const dd=delta*D2R*sd;c.strokeStyle='#ff7a2f';c.lineWidth=4;c.beginPath();c.moveTo(60-14*Math.sin(dd),74+14*Math.cos(dd));c.lineTo(60+14*Math.sin(dd),74-14*Math.cos(dd));c.stroke()}
+ // Backend force-vs-angle curve (same force values used by the controller).
+ const k=cr,cwid=190,ch2=120;k.clearRect(0,0,cwid,ch2);const pts=[];
+ if(result?.curve){for(let i=0;i<result.curve.d.length;i++)pts.push([result.curve.d[i],result.curve.fx[i],result.curve.fy_abs[i],result.curve.over_limit[i]])}
+ let mx=20;pts.forEach(p=>mx=Math.max(mx,Math.abs(p[1]),Math.abs(p[2])));
+ const X=d=>10+(d+30)/60*170,Y=val=>60-val/mx*52;k.fillStyle='rgba(220,60,50,.18)';pts.forEach(p=>{if(p[3])k.fillRect(X(p[0])-1.4,4,3,112)});
+ k.strokeStyle=css('--line');k.beginPath();k.moveTo(10,Y(0));k.lineTo(180,Y(0));k.stroke();
+ [[1,'#3ddc84'],[2,'#ffb347']].forEach(([i,cl])=>{k.strokeStyle=cl;k.lineWidth=2;k.beginPath();pts.forEach((p,j)=>j?k.lineTo(X(p[0]),Y(p[i])):k.moveTo(X(p[0]),Y(p[i])));k.stroke()});
+ k.fillStyle=css('--mute');k.font='10px sans-serif';k.fillText('−30°',4,116);k.fillText('+30°',158,116);k.fillText('fin angle',72,116);
+ if(on){k.strokeStyle=css('--ink');k.lineWidth=1;k.beginPath();k.moveTo(X(delta),4);k.lineTo(X(delta),104);k.stroke()}
+ if(!paused){hist.push([on?f.fx:0,on?1:0,fixfx]);if(hist.length>900)hist.shift()}
+ const hc=$('hst').getContext('2d');hc.clearRect(0,0,310,64);hc.lineWidth=1;hc.strokeStyle=css('--line');hc.beginPath();hc.moveTo(0,32);hc.lineTo(310,32);hc.stroke();
+ let hm=20;hist.forEach(h=>hm=Math.max(hm,Math.abs(h[0]),Math.abs(h[2])));
+ [[2,css('--mute')],[0,'#3ddc84']].forEach(([i,cl])=>{hc.strokeStyle=cl;hc.lineWidth=i?1:2;hc.beginPath();hist.forEach((h,j)=>{const x=j/900*310,y=32-h[i]/hm*28;j?hc.lineTo(x,y):hc.moveTo(x,y)});hc.stroke()});
+ // airflow in the car frame
+ const fxv=-sx,fzv=-sz;if(lines.visible)for(let i=0;i<N;i++){const j=i*3;P[j]+=fxv*dt;P[j+2]+=fzv*dt;
+  if(Math.abs(P[j])>13||Math.abs(P[j+2])>7){if(Math.random()<Math.abs(fxv)/(Math.abs(fxv)+Math.abs(fzv)+1e-6)){P[j]=-Math.sign(fxv||1)*13;P[j+2]=(Math.random()-.5)*14}else{P[j+2]=-Math.sign(fzv||1)*7;P[j]=(Math.random()-.5)*26}P[j+1]=.08+Math.random()*2.4}
+  if(P[j+1]<.52&&Math.abs((P[j]-CX)/A)**3+Math.abs(P[j+2]/B)**3<1)P[j+1]=.54;
+  const m=i*6;L[m]=P[j];L[m+1]=P[j+1];L[m+2]=P[j+2];L[m+3]=P[j]-fxv*.05;L[m+4]=P[j+1];L[m+5]=P[j+2]-fzv*.05}
+ lg.attributes.position.needsUpdate=true;
+ wheels.forEach(w=>w.rotation.z-=v/WR*dt);dashes.forEach(d=>{d.position.x-=v*dt;if(d.position.x<-80)d.position.x+=160});
+ if(orbit){tth+=dt0*.25;}const dd=((tth-th+Math.PI)%(2*Math.PI)+2*Math.PI)%(2*Math.PI)-Math.PI;th+=dd*Math.min(1,dt0*4);ph+=(tph-ph)*Math.min(1,dt0*4);rad+=(trad-rad)*Math.min(1,dt0*4);
+ cam.position.set(T.x+rad*Math.sin(ph)*Math.cos(th),T.y+rad*Math.cos(ph),T.z+rad*Math.sin(ph)*Math.sin(th));cam.lookAt(T);
+ R.render(sc,cam);requestAnimationFrame(tick)}
+car.traverse(o=>{if(o.isMesh){o.castShadow=true;o.receiveShadow=true}});gnd.receiveShadow=true;road.receiveShadow=true;
+tick();
+</script>
+</body>
+</html>
